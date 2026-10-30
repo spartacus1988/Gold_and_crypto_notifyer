@@ -3,6 +3,7 @@ import json
 import ssl
 import certifi
 import time
+import math
 import traceback
 import urllib.request
 import urllib.error
@@ -29,6 +30,10 @@ ASSETS = {
 INTERVAL = 60
 RSI_PERIOD = 14
 ATR_PERIOD = 14
+ADX_PERIOD = 14
+BB_PERIOD = 20
+BB_MULT = 2.0
+VOL_AVG_PERIOD = 20
 EMA_FAST = 9
 EMA_SLOW = 21
 MACD_FAST, MACD_SLOW, MACD_SIGNAL = 12, 26, 9
@@ -37,12 +42,12 @@ RSI_MODE = "reversion"     # "reversion" | "trend"
 
 # --- ЗВУК ---
 SOUND_ENABLED = True
-SOUND_FOR_NEUTRAL = False  # играть ли короткий сигнал при score == 0
+SOUND_FOR_NEUTRAL = False
 
 
 # ---------- 1. ЗАГРУЗКА ДАННЫХ ----------
-def fetch_ohlc():
-    """Возвращает (highs, lows, closes) — синхронно отфильтрованные бары."""
+def fetch_ohlcv():
+    """Возвращает (highs, lows, closes, volumes) — отфильтрованные бары."""
     cfg = ASSETS[ASSET]
     url = (
         "https://query1.finance.yahoo.com/v8/finance/chart/"
@@ -57,21 +62,26 @@ def fetch_ohlc():
 
     results = data.get("chart", {}).get("result") or []
     if not results:
-        return [], [], []
+        return [], [], [], []
 
     q = results[0]["indicators"]["quote"][0]
-    highs, lows, closes = q.get("high"), q.get("low"), q.get("close")
-    if not (highs and lows and closes):
-        return [], [], []
+    highs, lows = q.get("high"), q.get("low")
+    closes, volumes = q.get("close"), q.get("volume")
+    
+    if not (highs and lows and closes and volumes):
+        return [], [], [], []
 
-    H, L, C = [], [], []
-    for h, l, c in zip(highs, lows, closes):
+    H, L, C, V = [], [], [], []
+    for h, l, c, v in zip(highs, lows, closes, volumes):
+        # Для объема иногда бывает None, заменяем на 0
+        v_clean = v if v is not None else 0
         if h is None or l is None or c is None:
             continue
         H.append(h)
         L.append(l)
         C.append(c)
-    return H, L, C
+        V.append(v_clean)
+    return H, L, C, V
 
 
 # ---------- 2. ИНДИКАТОРЫ ----------
@@ -111,20 +121,23 @@ def rsi(values, period=14):
 
 def macd(values, fast=12, slow=26, signal=9):
     if len(values) < slow + signal:
-        return None, None, None
+        return None, None, None, None
     ema_fast = ema_series(values, fast)
     ema_slow = ema_series(values, slow)
     offset = slow - fast
     macd_line = [ema_fast[i + offset] - ema_slow[i] for i in range(len(ema_slow))]
     signal_line = ema_series(macd_line, signal)
     if not signal_line:
-        return None, None, None
+        return None, None, None, None
+    
     m, s = macd_line[-1], signal_line[-1]
-    return m, s, m - s
+    # Гистограмма текущая и предыдущая (чтобы понять, растет импульс или падает)
+    hist_current = m - s
+    hist_prev = macd_line[-2] - signal_line[-2] if len(signal_line) > 1 else hist_current
+    return m, s, hist_current, hist_prev
 
 
 def atr(highs, lows, closes, period=14):
-    """Average True Range по Уайлдеру — значение для последнего бара."""
     n = min(len(highs), len(lows), len(closes))
     if n < period + 1:
         return None
@@ -140,9 +153,55 @@ def atr(highs, lows, closes, period=14):
     return a
 
 
+def adx(highs, lows, closes, period=14):
+    """Возвращает (ADX, +DI, -DI)"""
+    n = min(len(highs), len(lows), len(closes))
+    if n < period * 2:
+        return None, None, None
+    trs, plus_dms, minus_dms = [], [], []
+    for i in range(1, n):
+        tr = max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
+        trs.append(tr)
+        up_move = highs[i] - highs[i-1]
+        down_move = lows[i-1] - lows[i]
+        plus_dm = up_move if up_move > down_move and up_move > 0 else 0
+        minus_dm = down_move if down_move > up_move and down_move > 0 else 0
+        plus_dms.append(plus_dm)
+        minus_dms.append(minus_dm)
+    
+    smoothed_tr = [sum(trs[:period])]
+    smoothed_plus = [sum(plus_dms[:period])]
+    smoothed_minus = [sum(minus_dms[:period])]
+    
+    for i in range(period, len(trs)):
+        smoothed_tr.append(smoothed_tr[-1] - (smoothed_tr[-1]/period) + trs[i])
+        smoothed_plus.append(smoothed_plus[-1] - (smoothed_plus[-1]/period) + plus_dms[i])
+        smoothed_minus.append(smoothed_minus[-1] - (smoothed_minus[-1]/period) + minus_dms[i])
+        
+    plus_di = [100 * p / t if t != 0 else 0 for p, t in zip(smoothed_plus, smoothed_tr)]
+    minus_di = [100 * m / t if t != 0 else 0 for m, t in zip(smoothed_minus, smoothed_tr)]
+    
+    dx = [100 * abs(p - m) / (p + m) if (p + m) != 0 else 0 for p, m in zip(plus_di, minus_di)]
+    
+    if len(dx) < period: return None, None, None
+    adx_val = sum(dx[:period]) / period
+    for i in range(period, len(dx)):
+        adx_val = (adx_val * (period - 1) + dx[i]) / period
+        
+    return adx_val, plus_di[-1], minus_di[-1]
+
+
+def bollinger(values, period=20, mult=2.0):
+    """Возвращает (Верхняя, Средняя, Нижняя)"""
+    if len(values) < period: return None, None, None
+    sma = sum(values[-period:]) / period
+    variance = sum((x - sma) ** 2 for x in values[-period:]) / period
+    std_dev = math.sqrt(variance)
+    return sma + (std_dev * mult), sma, sma - (std_dev * mult)
+
+
 # ---------- 3. ЗВУК ----------
 def _try_beep(freq_hz, duration_ms):
-    """Windows-бип. True если удалось."""
     try:
         import winsound
         winsound.Beep(int(freq_hz), int(duration_ms))
@@ -150,9 +209,7 @@ def _try_beep(freq_hz, duration_ms):
     except Exception:
         return False
 
-
 def _try_android_vibrate(duration_ms):
-    """Вибрация на Android (QPython / SL4A)."""
     try:
         import android
         android.Android().vibrate(int(duration_ms))
@@ -166,49 +223,34 @@ def _try_android_vibrate(duration_ms):
     except Exception:
         return False
 
-
 def _try_bell(count):
     for _ in range(max(1, count)):
         print("\a", end="", flush=True)
         time.sleep(0.1)
 
-
 def play_signal(score):
-    """Сила и направление сигнала → звук.
-       |score| = 1..3, знак = быки/медведи. score=0 → тишина (или SOUND_FOR_NEUTRAL)."""
-    if not SOUND_ENABLED:
-        return
+    if not SOUND_ENABLED: return
     if score == 0:
-        if not SOUND_FOR_NEUTRAL:
-            return
+        if not SOUND_FOR_NEUTRAL: return
         _try_beep(500, 40) or _try_android_vibrate(40) or _try_bell(1)
         return
-
-    strength = min(abs(score), 3)                          # 1..3
-    duration = 80 + 40 * strength                          # 120..200 мс
+    strength = min(abs(score), 3)
+    duration = 80 + 40 * strength
     freqs = [400, 600, 800] if score > 0 else [800, 600, 400]
-
-    # Windows: серия бипов с направлением
     ok = True
     for i in range(strength):
         if not _try_beep(freqs[i], duration):
             ok = False
             break
-    if ok:
-        return
-
-    # Android: вибрация ∝ силе
-    if _try_android_vibrate(100 * strength):
-        return
-
-    # Fallback: N звонков в терминал
+    if ok: return
+    if _try_android_vibrate(100 * strength): return
     _try_bell(strength)
 
 
 # ---------- 4. АНАЛИЗ ----------
 def analyze():
     cfg = ASSETS[ASSET]
-    highs, lows, closes = fetch_ohlc()
+    highs, lows, closes, volumes = fetch_ohlcv()
 
     if not closes or len(closes) < MACD_SLOW + MACD_SIGNAL:
         print(f"\n⏳ {datetime.now().strftime('%H:%M:%S')} — нет данных "
@@ -217,39 +259,90 @@ def analyze():
 
     price = closes[-1]
     dec = cfg["decimals"]
+    
     r = rsi(closes, RSI_PERIOD)
-    m, s, h = macd(closes, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
+    m, s, h, h_prev = macd(closes, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
     e_fast = ema_series(closes, EMA_FAST)
     e_slow = ema_series(closes, EMA_SLOW)
     atr_val = atr(highs, lows, closes, ATR_PERIOD)
+    adx_val, plus_di, minus_di = adx(highs, lows, closes, ADX_PERIOD)
+    bb_up, bb_mid, bb_low = bollinger(closes, BB_PERIOD, BB_MULT)
+    
+    # Средний объем
+    avg_vol = sum(volumes[-VOL_AVG_PERIOD:]) / VOL_AVG_PERIOD if len(volumes) >= VOL_AVG_PERIOD else 0
 
-    print("\n" + "=" * 48)
+    print("\n" + "=" * 50)
     print(f"🕒 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"💱 {cfg['name']} ({cfg['ticker']})")
     print(f"💰 Цена: {price:.{dec}f} USD | Баров: {len(closes)}")
 
+    # --- RSI ---
     if r is not None:
-        if r < 30:
-            tag = "перепродан → возможен рост"
-        elif r > 70:
-            tag = "перекуплен → возможна коррекция"
-        else:
-            tag = "нейтрально"
-        print(f"📈 RSI({RSI_PERIOD}): {r:.2f} ({tag})")
+        if r < 30: tag = "перепродан (ожидаем отскок вверх)"
+        elif r > 70: tag = "перекуплен (риск коррекции)"
+        elif r > 50: tag = "бычий настрой (выше 50)"
+        else: tag = "медвежий настрой (ниже 50)"
+        print(f"📈 RSI({RSI_PERIOD}): {r:.2f} → {tag}")
 
+    # --- MACD ---
     if m is not None:
-        direction = "бычий" if m > s else "медвежий"
-        print(f"📊 MACD: {m:.4f} | сигнал: {s:.4f} | гист: {h:+.4f} → {direction}")
+        if m > s:
+            direction = "БЫЧИЙ"
+            if h > h_prev: tag = "импульс растет"
+            else: tag = "импульс слабеет"
+        else:
+            direction = "МЕДВЕЖИЙ"
+            if h < h_prev: tag = "давление растет"
+            else: tag = "давление слабеет"
+        print(f"📊 MACD: {m:.4f} | сигнал: {s:.4f} | гист: {h:+.4f}")
+        print(f"   → {direction} ({tag})")
 
+    # --- EMA ---
     if e_fast and e_slow:
-        direction = "восходящий" if e_fast[-1] > e_slow[-1] else "нисходящий"
-        print(f"📉 EMA{EMA_FAST}={e_fast[-1]:.{dec}f} / "
-              f"EMA{EMA_SLOW}={e_slow[-1]:.{dec}f} → {direction}")
+        diff = e_fast[-1] - e_slow[-1]
+        if diff > 0:
+            tag = "восходящий тренд" if price > e_fast[-1] else "коррекция к EMA9"
+        else:
+            tag = "нисходящий тренд" if price < e_fast[-1] else "отскок к EMA9"
+        print(f"📉 EMA{EMA_FAST}={e_fast[-1]:.{dec}f} / EMA{EMA_SLOW}={e_slow[-1]:.{dec}f}")
+        print(f"   → {tag}")
 
+    # --- ATR (Волатильность) ---
     if atr_val is not None:
         atr_pct = atr_val / price * 100.0
-        print(f"📏 ATR({ATR_PERIOD}): {atr_val:.{dec}f} "
-              f"({atr_pct:.3f}% от цены)")
+        if atr_pct < 0.05: tag = "очень низкая (флэт, сжатие)"
+        elif atr_pct < 0.15: tag = "низкая (спокойный рынок)"
+        elif atr_pct < 0.3: tag = "умеренная (нормальный ход)"
+        else: tag = "высокая (волатильный рынок)"
+        print(f"📏 ATR({ATR_PERIOD}): {atr_val:.{dec}f} ({atr_pct:.3f}%) → {tag}")
+
+    # --- ADX (Сила тренда) ---
+    if adx_val is not None:
+        if adx_val < 20: tag = "ФЛЭТ / нет тренда"
+        elif adx_val < 25: tag = "зарождение тренда"
+        else: tag = "СИЛЬНЫЙ ТРЕНД"
+        di_dir = "Быки сильнее (+DI)" if plus_di > minus_di else "Медведи сильнее (-DI)"
+        print(f"🧗 ADX({ADX_PERIOD}): {adx_val:.1f} → {tag}")
+        print(f"   +DI: {plus_di:.1f} | -DI: {minus_di:.1f} → {di_dir}")
+
+    # --- Bollinger Bands ---
+    if bb_up is not None:
+        band_width_pct = (bb_up - bb_low) / bb_mid * 100.0
+        if price > bb_up: tag = "ПРОБОЙ ВЕРХНЕЙ (перегрев)"
+        elif price < bb_low: tag = "ПРОБОЙ НИЖНЕЙ (перепродажа)"
+        elif band_width_pct < 0.2: tag = "СЖАТИЕ (сквиз, ждем импульс)"
+        else: tag = "внутри канала"
+        print(f"🎈 BB({BB_PERIOD}): {bb_low:.{dec}f} | {bb_mid:.{dec}f} | {bb_up:.{dec}f}")
+        print(f"   → {tag}")
+
+    # --- Объем ---
+    current_vol = volumes[-1]
+    if avg_vol > 0:
+        vol_ratio = current_vol / avg_vol
+        if vol_ratio > 1.5: tag = "ВСПЛЕСК (подтверждение движения)"
+        elif vol_ratio < 0.5: tag = "низкий (нет интереса)"
+        else: tag = "средний (норма)"
+        print(f"📦 Объем: {current_vol:.0f} (ср. {avg_vol:.0f}) → {tag}")
 
     # Итоговый счёт (логика не изменена)
     score = 0
@@ -272,9 +365,9 @@ def analyze():
         -2: "🔴 Умеренно медвежий",
         -3: "🔴 Сильный медвежий",
     }[score]
+    print("-" * 50)
     print(f"🧭 Сводка (score={score:+d}): {verdict}")
-
-    # Звуковое сопровождение: сила и направление ∝ score
+    
     play_signal(score)
 
 
@@ -283,8 +376,6 @@ def main():
     cfg = ASSETS[ASSET]
     print(f"🚀 Анализатор {cfg['name']} ({cfg['ticker']}) запущен.")
     print(f"   Обновление каждые {INTERVAL} сек. Остановить: Ctrl+C.")
-    print(f"   Звук: {'вкл' if SOUND_ENABLED else 'выкл'}, "
-          f"сила ∝ |score|, направление ∝ знаку score.")
     while True:
         try:
             analyze()
