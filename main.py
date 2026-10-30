@@ -4,6 +4,7 @@ import ssl
 import certifi
 import time
 import math
+import os
 import traceback
 import urllib.request
 import urllib.error
@@ -44,10 +45,39 @@ RSI_MODE = "reversion"     # "reversion" | "trend"
 SOUND_ENABLED = True
 SOUND_FOR_NEUTRAL = False
 
+# --- БОТ ---
+INITIAL_BALANCE = 100.0    # Баланс по умолчанию
+STATE_FILE = "bot_state.json"
 
-# ---------- 1. ЗАГРУЗКА ДАННЫХ ----------
+
+# ---------- 1. СОСТОЯНИЕ БОТА (БАЛАНС) ----------
+def load_state():
+    """Загружает состояние из файла или создает новое."""
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                state = json.load(f)
+                # Проверка на всякий случай
+                if "usd" in state and "asset" in state and "entry" in state:
+                    return state
+        except Exception:
+            pass
+    
+    # Если файла нет или он битый — создаем базовый
+    return {"usd": INITIAL_BALANCE, "asset": 0.0, "entry": 0.0}
+
+
+def save_state(state):
+    """Сохраняет состояние в файл."""
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=4)
+    except Exception as e:
+        print(f"⚠️ Ошибка сохранения баланса: {e}")
+
+
+# ---------- 2. ЗАГРУЗКА ДАННЫХ ----------
 def fetch_ohlcv():
-    """Возвращает (highs, lows, closes, volumes) — отфильтрованные бары."""
     cfg = ASSETS[ASSET]
     url = (
         "https://query1.finance.yahoo.com/v8/finance/chart/"
@@ -73,7 +103,6 @@ def fetch_ohlcv():
 
     H, L, C, V = [], [], [], []
     for h, l, c, v in zip(highs, lows, closes, volumes):
-        # Для объема иногда бывает None, заменяем на 0
         v_clean = v if v is not None else 0
         if h is None or l is None or c is None:
             continue
@@ -84,7 +113,7 @@ def fetch_ohlcv():
     return H, L, C, V
 
 
-# ---------- 2. ИНДИКАТОРЫ ----------
+# ---------- 3. ИНДИКАТОРЫ ----------
 def ema_series(values, period):
     if len(values) < period:
         return []
@@ -131,7 +160,6 @@ def macd(values, fast=12, slow=26, signal=9):
         return None, None, None, None
     
     m, s = macd_line[-1], signal_line[-1]
-    # Гистограмма текущая и предыдущая (чтобы понять, растет импульс или падает)
     hist_current = m - s
     hist_prev = macd_line[-2] - signal_line[-2] if len(signal_line) > 1 else hist_current
     return m, s, hist_current, hist_prev
@@ -154,7 +182,6 @@ def atr(highs, lows, closes, period=14):
 
 
 def adx(highs, lows, closes, period=14):
-    """Возвращает (ADX, +DI, -DI)"""
     n = min(len(highs), len(lows), len(closes))
     if n < period * 2:
         return None, None, None
@@ -180,7 +207,6 @@ def adx(highs, lows, closes, period=14):
         
     plus_di = [100 * p / t if t != 0 else 0 for p, t in zip(smoothed_plus, smoothed_tr)]
     minus_di = [100 * m / t if t != 0 else 0 for m, t in zip(smoothed_minus, smoothed_tr)]
-    
     dx = [100 * abs(p - m) / (p + m) if (p + m) != 0 else 0 for p, m in zip(plus_di, minus_di)]
     
     if len(dx) < period: return None, None, None
@@ -192,7 +218,6 @@ def adx(highs, lows, closes, period=14):
 
 
 def bollinger(values, period=20, mult=2.0):
-    """Возвращает (Верхняя, Средняя, Нижняя)"""
     if len(values) < period: return None, None, None
     sma = sum(values[-period:]) / period
     variance = sum((x - sma) ** 2 for x in values[-period:]) / period
@@ -200,7 +225,7 @@ def bollinger(values, period=20, mult=2.0):
     return sma + (std_dev * mult), sma, sma - (std_dev * mult)
 
 
-# ---------- 3. ЗВУК ----------
+# ---------- 4. ЗВУК ----------
 def _try_beep(freq_hz, duration_ms):
     try:
         import winsound
@@ -247,15 +272,63 @@ def play_signal(score):
     _try_bell(strength)
 
 
-# ---------- 4. АНАЛИЗ ----------
+# ---------- 5. ЛОГИКА БОТА ----------
+def bot_action(price, score, state):
+    """
+    Принимает простейшие решения.
+    Возвращает: (действие, обновленное_состояние, сообщение)
+    """
+    usd = state["usd"]
+    asset = state["asset"]
+    entry = state["entry"]
+    
+    action = "WAIT"
+    msg = ""
+
+    if usd > 0 and asset == 0:
+        # Мы в кэше. Ищем сигнал на покупку.
+        if score >= 2:
+            asset = usd / price
+            usd = 0.0
+            entry = price
+            action = "BUY"
+            msg = f"🟢 КУПИЛ {asset:.6f} ед. по ${price:.2f}"
+    elif asset > 0:
+        # Мы в позиции. Ищем сигнал на продажу.
+        if score <= 0:
+            usd = asset * price
+            asset = 0.0
+            pnl = usd - (entry * (usd / price) if price != 0 else usd) # Упрощенно
+            # Реальный расчет PnL: продали по текущей цене, вычли то, что потратили
+            # Если entry != 0, считаем разницу
+            profit = (price - entry) * asset
+            action = "SELL"
+            msg = f"🔴 ПРОДАЛ {asset:.6f} ед. по ${price:.2f} (PnL: {profit:+.2f} USD)"
+            asset = 0.0
+            entry = 0.0
+        else:
+            action = "HOLD"
+            profit = (price - entry) * asset
+            msg = f"🔵 ДЕРЖУ ПОЗИЦИЮ (Вход: ${entry:.2f}, PnL: {profit:+.2f} USD)"
+    else:
+        action = "WAIT"
+        msg = "⚪ БЕЗДЕЙСТВУЮ (нет сигналов, баланс в кэше)"
+        
+    new_state = {"usd": usd, "asset": asset, "entry": entry}
+    return action, new_state, msg
+
+
+# ---------- 6. АНАЛИЗ ----------
 def analyze():
     cfg = ASSETS[ASSET]
     highs, lows, closes, volumes = fetch_ohlcv()
 
     if not closes or len(closes) < MACD_SLOW + MACD_SIGNAL:
-        print(f"\n⏳ {datetime.now().strftime('%H:%M:%S')} — нет данных "
-              f"({cfg['name']}: рынок закрыт или мало истории).")
+        print(f"\n⏳ {datetime.now().strftime('%H:%M:%S')} — нет данных.")
         return
+
+    # Загружаем состояние бота
+    state = load_state()
 
     price = closes[-1]
     dec = cfg["decimals"]
@@ -267,8 +340,6 @@ def analyze():
     atr_val = atr(highs, lows, closes, ATR_PERIOD)
     adx_val, plus_di, minus_di = adx(highs, lows, closes, ADX_PERIOD)
     bb_up, bb_mid, bb_low = bollinger(closes, BB_PERIOD, BB_MULT)
-    
-    # Средний объем
     avg_vol = sum(volumes[-VOL_AVG_PERIOD:]) / VOL_AVG_PERIOD if len(volumes) >= VOL_AVG_PERIOD else 0
 
     print("\n" + "=" * 50)
@@ -276,7 +347,6 @@ def analyze():
     print(f"💱 {cfg['name']} ({cfg['ticker']})")
     print(f"💰 Цена: {price:.{dec}f} USD | Баров: {len(closes)}")
 
-    # --- RSI ---
     if r is not None:
         if r < 30: tag = "перепродан (ожидаем отскок вверх)"
         elif r > 70: tag = "перекуплен (риск коррекции)"
@@ -284,20 +354,16 @@ def analyze():
         else: tag = "медвежий настрой (ниже 50)"
         print(f"📈 RSI({RSI_PERIOD}): {r:.2f} → {tag}")
 
-    # --- MACD ---
     if m is not None:
         if m > s:
             direction = "БЫЧИЙ"
-            if h > h_prev: tag = "импульс растет"
-            else: tag = "импульс слабеет"
+            tag = "импульс растет" if h > h_prev else "импульс слабеет"
         else:
             direction = "МЕДВЕЖИЙ"
-            if h < h_prev: tag = "давление растет"
-            else: tag = "давление слабеет"
+            tag = "давление растет" if h < h_prev else "давление слабеет"
         print(f"📊 MACD: {m:.4f} | сигнал: {s:.4f} | гист: {h:+.4f}")
         print(f"   → {direction} ({tag})")
 
-    # --- EMA ---
     if e_fast and e_slow:
         diff = e_fast[-1] - e_slow[-1]
         if diff > 0:
@@ -307,7 +373,6 @@ def analyze():
         print(f"📉 EMA{EMA_FAST}={e_fast[-1]:.{dec}f} / EMA{EMA_SLOW}={e_slow[-1]:.{dec}f}")
         print(f"   → {tag}")
 
-    # --- ATR (Волатильность) ---
     if atr_val is not None:
         atr_pct = atr_val / price * 100.0
         if atr_pct < 0.05: tag = "очень низкая (флэт, сжатие)"
@@ -316,7 +381,6 @@ def analyze():
         else: tag = "высокая (волатильный рынок)"
         print(f"📏 ATR({ATR_PERIOD}): {atr_val:.{dec}f} ({atr_pct:.3f}%) → {tag}")
 
-    # --- ADX (Сила тренда) ---
     if adx_val is not None:
         if adx_val < 20: tag = "ФЛЭТ / нет тренда"
         elif adx_val < 25: tag = "зарождение тренда"
@@ -325,7 +389,6 @@ def analyze():
         print(f"🧗 ADX({ADX_PERIOD}): {adx_val:.1f} → {tag}")
         print(f"   +DI: {plus_di:.1f} | -DI: {minus_di:.1f} → {di_dir}")
 
-    # --- Bollinger Bands ---
     if bb_up is not None:
         band_width_pct = (bb_up - bb_low) / bb_mid * 100.0
         if price > bb_up: tag = "ПРОБОЙ ВЕРХНЕЙ (перегрев)"
@@ -335,7 +398,6 @@ def analyze():
         print(f"🎈 BB({BB_PERIOD}): {bb_low:.{dec}f} | {bb_mid:.{dec}f} | {bb_up:.{dec}f}")
         print(f"   → {tag}")
 
-    # --- Объем ---
     current_vol = volumes[-1]
     if avg_vol > 0:
         vol_ratio = current_vol / avg_vol
@@ -344,7 +406,7 @@ def analyze():
         else: tag = "средний (норма)"
         print(f"📦 Объем: {current_vol:.0f} (ср. {avg_vol:.0f}) → {tag}")
 
-    # Итоговый счёт (логика не изменена)
+    # Итоговый счёт
     score = 0
     if r is not None:
         if RSI_MODE == "reversion":
@@ -368,14 +430,40 @@ def analyze():
     print("-" * 50)
     print(f"🧭 Сводка (score={score:+d}): {verdict}")
     
+    # Вызов торгового бота
+    action, new_state, bot_msg = bot_action(price, score, state)
+    
+    # Сохраняем состояние и выводим отчет
+    save_state(new_state)
+    
+    print("=" * 50)
+    print(f"🤖 ДЕЙСТВИЕ БОТА: {bot_msg}")
+    
+    # Расчитываем общий капитал (Equity)
+    total_usd = new_state["usd"]
+    total_asset = new_state["asset"]
+    equity = total_usd + (total_asset * price)
+    
+    print(f"💼 ТЕКУЩИЙ БАЛАНС:")
+    print(f"   💵 USD: ${new_state['usd']:.2f}")
+    if new_state['asset'] > 0:
+        print(f"   🪙 АКТИВ: {new_state['asset']:.6f} (в USD: ${new_state['asset'] * price:.2f})")
+    print(f"   🏦 ВСЕГО EQUITY: ${equity:.2f} USD")
+
     play_signal(score)
 
 
-# ---------- 5. ЦИКЛ ----------
+# ---------- 7. ЦИКЛ ----------
 def main():
     cfg = ASSETS[ASSET]
     print(f"🚀 Анализатор {cfg['name']} ({cfg['ticker']}) запущен.")
     print(f"   Обновление каждые {INTERVAL} сек. Остановить: Ctrl+C.")
+    
+    # Проверяем баланс при старте (создаст файл, если его нет)
+    state = load_state()
+    save_state(state)
+    print(f"💰 Стартовый баланс: ${state['usd']:.2f} (Актив: {state['asset']:.6f})")
+    
     while True:
         try:
             analyze()
