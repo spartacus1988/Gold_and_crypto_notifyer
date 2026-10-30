@@ -15,31 +15,34 @@ ASSETS = {
     "gold": {
         "ticker":   "GC=F",
         "name":     "Золото (фьючерс)",
-        "range":    "5d",     # 5 дней — чтобы данные остались после выходных
+        "range":    "5d",
         "decimals": 2,
     },
     "btc": {
         "ticker":   "BTC-USD",
         "name":     "Bitcoin",
-        "range":    "1d",     # крипта торгуется 24/7
+        "range":    "1d",
         "decimals": 2,
     },
 }
 
 INTERVAL = 60
 RSI_PERIOD = 14
+ATR_PERIOD = 14
 EMA_FAST = 9
 EMA_SLOW = 21
 MACD_FAST, MACD_SLOW, MACD_SIGNAL = 12, 26, 9
 
-# Логика RSI в итоговом счёте:
-#   "reversion" — RSI<30 → +1, RSI>70 → -1  (контртренд, как было)
-#   "trend"     — RSI>50 → +1, RSI<50 → -1  (по тренду)
-RSI_MODE = "reversion"
+RSI_MODE = "reversion"     # "reversion" | "trend"
+
+# --- ЗВУК ---
+SOUND_ENABLED = True
+SOUND_FOR_NEUTRAL = False  # играть ли короткий сигнал при score == 0
 
 
 # ---------- 1. ЗАГРУЗКА ДАННЫХ ----------
-def fetch_closes():
+def fetch_ohlc():
+    """Возвращает (highs, lows, closes) — синхронно отфильтрованные бары."""
     cfg = ASSETS[ASSET]
     url = (
         "https://query1.finance.yahoo.com/v8/finance/chart/"
@@ -54,14 +57,25 @@ def fetch_closes():
 
     results = data.get("chart", {}).get("result") or []
     if not results:
-        return []
-    quotes = results[0]["indicators"]["quote"][0]["close"]
-    return [c for c in quotes if c is not None]
+        return [], [], []
+
+    q = results[0]["indicators"]["quote"][0]
+    highs, lows, closes = q.get("high"), q.get("low"), q.get("close")
+    if not (highs and lows and closes):
+        return [], [], []
+
+    H, L, C = [], [], []
+    for h, l, c in zip(highs, lows, closes):
+        if h is None or l is None or c is None:
+            continue
+        H.append(h)
+        L.append(l)
+        C.append(c)
+    return H, L, C
 
 
 # ---------- 2. ИНДИКАТОРЫ ----------
 def ema_series(values, period):
-    """EMA по классической формуле, seed = SMA первых period значений."""
     if len(values) < period:
         return []
     k = 2.0 / (period + 1)
@@ -73,7 +87,6 @@ def ema_series(values, period):
 
 
 def rsi(values, period=14):
-    """RSI по Уайлдеру. Флэт (avg_gain=avg_loss=0) → 50."""
     if len(values) < period + 1:
         return None
     gains, losses = [], []
@@ -97,28 +110,105 @@ def rsi(values, period=14):
 
 
 def macd(values, fast=12, slow=26, signal=9):
-    """Возвращает (MACD-линия, сигнальная, гистограмма) для последнего бара."""
     if len(values) < slow + signal:
         return None, None, None
     ema_fast = ema_series(values, fast)
     ema_slow = ema_series(values, slow)
-
     offset = slow - fast
     macd_line = [ema_fast[i + offset] - ema_slow[i] for i in range(len(ema_slow))]
-
     signal_line = ema_series(macd_line, signal)
     if not signal_line:
         return None, None, None
-
-    m = macd_line[-1]
-    s = signal_line[-1]
+    m, s = macd_line[-1], signal_line[-1]
     return m, s, m - s
 
 
-# ---------- 3. АНАЛИЗ ----------
+def atr(highs, lows, closes, period=14):
+    """Average True Range по Уайлдеру — значение для последнего бара."""
+    n = min(len(highs), len(lows), len(closes))
+    if n < period + 1:
+        return None
+    trs = []
+    for i in range(1, n):
+        h, l, pc = highs[i], lows[i], closes[i - 1]
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    if len(trs) < period:
+        return None
+    a = sum(trs[:period]) / period
+    for i in range(period, len(trs)):
+        a = (a * (period - 1) + trs[i]) / period
+    return a
+
+
+# ---------- 3. ЗВУК ----------
+def _try_beep(freq_hz, duration_ms):
+    """Windows-бип. True если удалось."""
+    try:
+        import winsound
+        winsound.Beep(int(freq_hz), int(duration_ms))
+        return True
+    except Exception:
+        return False
+
+
+def _try_android_vibrate(duration_ms):
+    """Вибрация на Android (QPython / SL4A)."""
+    try:
+        import android
+        android.Android().vibrate(int(duration_ms))
+        return True
+    except Exception:
+        pass
+    try:
+        import androidhelper as android
+        android.Android().vibrate(int(duration_ms))
+        return True
+    except Exception:
+        return False
+
+
+def _try_bell(count):
+    for _ in range(max(1, count)):
+        print("\a", end="", flush=True)
+        time.sleep(0.1)
+
+
+def play_signal(score):
+    """Сила и направление сигнала → звук.
+       |score| = 1..3, знак = быки/медведи. score=0 → тишина (или SOUND_FOR_NEUTRAL)."""
+    if not SOUND_ENABLED:
+        return
+    if score == 0:
+        if not SOUND_FOR_NEUTRAL:
+            return
+        _try_beep(500, 40) or _try_android_vibrate(40) or _try_bell(1)
+        return
+
+    strength = min(abs(score), 3)                          # 1..3
+    duration = 80 + 40 * strength                          # 120..200 мс
+    freqs = [400, 600, 800] if score > 0 else [800, 600, 400]
+
+    # Windows: серия бипов с направлением
+    ok = True
+    for i in range(strength):
+        if not _try_beep(freqs[i], duration):
+            ok = False
+            break
+    if ok:
+        return
+
+    # Android: вибрация ∝ силе
+    if _try_android_vibrate(100 * strength):
+        return
+
+    # Fallback: N звонков в терминал
+    _try_bell(strength)
+
+
+# ---------- 4. АНАЛИЗ ----------
 def analyze():
     cfg = ASSETS[ASSET]
-    closes = fetch_closes()
+    highs, lows, closes = fetch_ohlc()
 
     if not closes or len(closes) < MACD_SLOW + MACD_SIGNAL:
         print(f"\n⏳ {datetime.now().strftime('%H:%M:%S')} — нет данных "
@@ -131,6 +221,7 @@ def analyze():
     m, s, h = macd(closes, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
     e_fast = ema_series(closes, EMA_FAST)
     e_slow = ema_series(closes, EMA_SLOW)
+    atr_val = atr(highs, lows, closes, ATR_PERIOD)
 
     print("\n" + "=" * 48)
     print(f"🕒 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -155,12 +246,17 @@ def analyze():
         print(f"📉 EMA{EMA_FAST}={e_fast[-1]:.{dec}f} / "
               f"EMA{EMA_SLOW}={e_slow[-1]:.{dec}f} → {direction}")
 
-    # Итоговый счёт
+    if atr_val is not None:
+        atr_pct = atr_val / price * 100.0
+        print(f"📏 ATR({ATR_PERIOD}): {atr_val:.{dec}f} "
+              f"({atr_pct:.3f}% от цены)")
+
+    # Итоговый счёт (логика не изменена)
     score = 0
     if r is not None:
         if RSI_MODE == "reversion":
             score += 1 if r < 30 else (-1 if r > 70 else 0)
-        else:  # "trend"
+        else:
             score += 1 if r > 50 else -1
     if m is not None:
         score += 1 if m > s else -1
@@ -178,12 +274,17 @@ def analyze():
     }[score]
     print(f"🧭 Сводка (score={score:+d}): {verdict}")
 
+    # Звуковое сопровождение: сила и направление ∝ score
+    play_signal(score)
 
-# ---------- 4. ЦИКЛ ----------
+
+# ---------- 5. ЦИКЛ ----------
 def main():
     cfg = ASSETS[ASSET]
     print(f"🚀 Анализатор {cfg['name']} ({cfg['ticker']}) запущен.")
     print(f"   Обновление каждые {INTERVAL} сек. Остановить: Ctrl+C.")
+    print(f"   Звук: {'вкл' if SOUND_ENABLED else 'выкл'}, "
+          f"сила ∝ |score|, направление ∝ знаку score.")
     while True:
         try:
             analyze()
