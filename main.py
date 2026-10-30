@@ -1,44 +1,65 @@
-
 # -*- coding: utf-8 -*-
 import json
 import ssl
 import certifi
 import time
+import traceback
 import urllib.request
+import urllib.error
 from datetime import datetime
 
 # --- НАСТРОЙКИ ---
-SYMBOL = "GC=F"        # Золото (фьючерс). Для спота можно попробовать "XAUUSD=X"
-INTERVAL = 60          # Запрос каждую минуту
+ASSET = "btc"   # "gold" | "btc"
+
+ASSETS = {
+    "gold": {
+        "ticker":   "GC=F",
+        "name":     "Золото (фьючерс)",
+        "range":    "5d",     # 5 дней — чтобы данные остались после выходных
+        "decimals": 2,
+    },
+    "btc": {
+        "ticker":   "BTC-USD",
+        "name":     "Bitcoin",
+        "range":    "1d",     # крипта торгуется 24/7
+        "decimals": 2,
+    },
+}
+
+INTERVAL = 60
 RSI_PERIOD = 14
 EMA_FAST = 9
 EMA_SLOW = 21
 MACD_FAST, MACD_SLOW, MACD_SIGNAL = 12, 26, 9
 
+# Логика RSI в итоговом счёте:
+#   "reversion" — RSI<30 → +1, RSI>70 → -1  (контртренд, как было)
+#   "trend"     — RSI>50 → +1, RSI<50 → -1  (по тренду)
+RSI_MODE = "reversion"
+
 
 # ---------- 1. ЗАГРУЗКА ДАННЫХ ----------
-
 def fetch_closes():
+    cfg = ASSETS[ASSET]
     url = (
         "https://query1.finance.yahoo.com/v8/finance/chart/"
-        f"{SYMBOL}?interval=1m&range=1d"
+        f"{cfg['ticker']}?interval=1m&range={cfg['range']}"
     )
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    
-    # Создаём контекст с сертификатами из certifi
     context = ssl.create_default_context(cafile=certifi.where())
-    
+
     with urllib.request.urlopen(req, timeout=15, context=context) as resp:
         raw = resp.read().decode("utf-8")
     data = json.loads(raw)
 
-    result = data["chart"]["result"][0]
-    quotes = result["indicators"]["quote"][0]["close"]
-    closes = [c for c in quotes if c is not None]
-    return closes
+    results = data.get("chart", {}).get("result") or []
+    if not results:
+        return []
+    quotes = results[0]["indicators"]["quote"][0]["close"]
+    return [c for c in quotes if c is not None]
 
 
-# ---------- 2. ИНДИКАТОРЫ (вручную) ----------
+# ---------- 2. ИНДИКАТОРЫ ----------
 def ema_series(values, period):
     """EMA по классической формуле, seed = SMA первых period значений."""
     if len(values) < period:
@@ -52,7 +73,7 @@ def ema_series(values, period):
 
 
 def rsi(values, period=14):
-    """RSI по Уайлдеру (сглаживание как в MT4/TradingView)."""
+    """RSI по Уайлдеру. Флэт (avg_gain=avg_loss=0) → 50."""
     if len(values) < period + 1:
         return None
     gains, losses = [], []
@@ -67,6 +88,8 @@ def rsi(values, period=14):
         avg_gain = (avg_gain * (period - 1) + gains[i]) / period
         avg_loss = (avg_loss * (period - 1) + losses[i]) / period
 
+    if avg_loss == 0 and avg_gain == 0:
+        return 50.0
     if avg_loss == 0:
         return 100.0
     rs = avg_gain / avg_loss
@@ -80,7 +103,6 @@ def macd(values, fast=12, slow=26, signal=9):
     ema_fast = ema_series(values, fast)
     ema_slow = ema_series(values, slow)
 
-    # Выравниваем по длине: ema_fast длиннее на (slow - fast) значений
     offset = slow - fast
     macd_line = [ema_fast[i + offset] - ema_slow[i] for i in range(len(ema_slow))]
 
@@ -93,22 +115,27 @@ def macd(values, fast=12, slow=26, signal=9):
     return m, s, m - s
 
 
-# ---------- 3. АНАЛИЗ И ВЫВОД ----------
+# ---------- 3. АНАЛИЗ ----------
 def analyze():
+    cfg = ASSETS[ASSET]
     closes = fetch_closes()
-    if len(closes) < MACD_SLOW + MACD_SIGNAL:
-        print("⏳ Недостаточно данных (рынок закрыт или мало истории).")
+
+    if not closes or len(closes) < MACD_SLOW + MACD_SIGNAL:
+        print(f"\n⏳ {datetime.now().strftime('%H:%M:%S')} — нет данных "
+              f"({cfg['name']}: рынок закрыт или мало истории).")
         return
 
     price = closes[-1]
+    dec = cfg["decimals"]
     r = rsi(closes, RSI_PERIOD)
     m, s, h = macd(closes, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
     e_fast = ema_series(closes, EMA_FAST)
     e_slow = ema_series(closes, EMA_SLOW)
 
-    print("\n" + "=" * 42)
+    print("\n" + "=" * 48)
     print(f"🕒 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"💰 Цена: {price:.2f} USD | Баров: {len(closes)}")
+    print(f"💱 {cfg['name']} ({cfg['ticker']})")
+    print(f"💰 Цена: {price:.{dec}f} USD | Баров: {len(closes)}")
 
     if r is not None:
         if r < 30:
@@ -121,42 +148,54 @@ def analyze():
 
     if m is not None:
         direction = "бычий" if m > s else "медвежий"
-        print(f"📊 MACD: {m:.3f} | сигнал: {s:.3f} | гист: {h:+.3f} → {direction}")
+        print(f"📊 MACD: {m:.4f} | сигнал: {s:.4f} | гист: {h:+.4f} → {direction}")
 
     if e_fast and e_slow:
         direction = "восходящий" if e_fast[-1] > e_slow[-1] else "нисходящий"
-        print(f"📉 EMA{EMA_FAST}={e_fast[-1]:.2f} / EMA{EMA_SLOW}={e_slow[-1]:.2f} → {direction}")
+        print(f"📉 EMA{EMA_FAST}={e_fast[-1]:.{dec}f} / "
+              f"EMA{EMA_SLOW}={e_slow[-1]:.{dec}f} → {direction}")
 
-    # Итоговая сводка по трём индикаторам
+    # Итоговый счёт
     score = 0
     if r is not None:
-        score += 1 if r < 30 else (-1 if r > 70 else 0)
+        if RSI_MODE == "reversion":
+            score += 1 if r < 30 else (-1 if r > 70 else 0)
+        else:  # "trend"
+            score += 1 if r > 50 else -1
     if m is not None:
         score += 1 if m > s else -1
     if e_fast and e_slow:
         score += 1 if e_fast[-1] > e_slow[-1] else -1
 
     verdict = {
-        3: "🟢 Сильный бычий сигнал",
-        2: "🟢 Умеренно бычий",
-        1: "🟡 Слабый бычий",
-        0: "⚪ Нейтрально",
+        3:  "🟢 Сильный бычий сигнал",
+        2:  "🟢 Умеренно бычий",
+        1:  "🟡 Слабый бычий",
+        0:  "⚪ Нейтрально",
         -1: "🟡 Слабый медвежий",
         -2: "🔴 Умеренно медвежий",
         -3: "🔴 Сильный медвежий",
     }[score]
-    print(f"🧭 Сводка: {verdict}")
+    print(f"🧭 Сводка (score={score:+d}): {verdict}")
 
 
 # ---------- 4. ЦИКЛ ----------
 def main():
-    print(f"🚀 Анализатор золота запущен ({SYMBOL}). Обновление каждые {INTERVAL} сек.")
-    print("Остановить: Ctrl+C в консоли QPython.")
+    cfg = ASSETS[ASSET]
+    print(f"🚀 Анализатор {cfg['name']} ({cfg['ticker']}) запущен.")
+    print(f"   Обновление каждые {INTERVAL} сек. Остановить: Ctrl+C.")
     while True:
         try:
             analyze()
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                print("⚠️ Yahoo rate limit (429). Жду 120 сек...")
+                time.sleep(120)
+                continue
+            print(f"⚠️ HTTP {e.code}: {e.reason}")
         except Exception as e:
             print(f"⚠️ Ошибка: {e}")
+            traceback.print_exc()
         time.sleep(INTERVAL)
 
 
