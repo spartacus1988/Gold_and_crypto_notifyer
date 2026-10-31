@@ -49,22 +49,34 @@ SOUND_FOR_NEUTRAL = False
 INITIAL_BALANCE = 100.0    # Баланс по умолчанию
 STATE_FILE = "bot_state.json"
 
+# Настройки риск-менеджмента
+STOP_LOSS_PCT = 2.0        # Выход, если просадка 2%
+TAKE_PROFIT_PCT = 5.0      # Выход, если прибыль 5%
+MAX_HOLD_TIME_MIN = 60     # Выход по времени (минут)
 
-# ---------- 1. СОСТОЯНИЕ БОТА (БАЛАНС) ----------
+
+# ---------- 1. СОСТОЯНИЕ БОТА ----------
 def load_state():
     """Загружает состояние из файла или создает новое."""
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r", encoding="utf-8") as f:
                 state = json.load(f)
-                # Проверка на всякий случай
-                if "usd" in state and "asset" in state and "entry" in state:
-                    return state
+                # Добавляем недостающие ключи для совместимости
+                state.setdefault("entry_time", 0.0)
+                state.setdefault("base_volume", 0.0)
+                return state
         except Exception:
             pass
     
-    # Если файла нет или он битый — создаем базовый
-    return {"usd": INITIAL_BALANCE, "asset": 0.0, "entry": 0.0}
+    # Если файла нет или он битый
+    return {
+        "usd": INITIAL_BALANCE, 
+        "asset": 0.0, 
+        "entry": 0.0,
+        "entry_time": 0.0,
+        "base_volume": 0.0
+    }
 
 
 def save_state(state):
@@ -255,11 +267,13 @@ def _try_bell(count):
 
 def play_signal(score):
     if not SOUND_ENABLED: return
+    # Теперь score может быть от -6 до +6. Ограничиваем громкость/силу до 3.
+    strength = min(abs(score) // 2 + 1, 3) 
     if score == 0:
         if not SOUND_FOR_NEUTRAL: return
         _try_beep(500, 40) or _try_android_vibrate(40) or _try_bell(1)
         return
-    strength = min(abs(score), 3)
+    
     duration = 80 + 40 * strength
     freqs = [400, 600, 800] if score > 0 else [800, 600, 400]
     ok = True
@@ -275,46 +289,71 @@ def play_signal(score):
 # ---------- 5. ЛОГИКА БОТА ----------
 def bot_action(price, score, state):
     """
-    Принимает простейшие решения.
-    Возвращает: (действие, обновленное_состояние, сообщение)
+    Умный бот с риск-менеджментом.
     """
     usd = state["usd"]
     asset = state["asset"]
     entry = state["entry"]
+    entry_time = state["entry_time"]
+    base_vol = state["base_volume"]
     
     action = "WAIT"
     msg = ""
-
-    if usd > 0 and asset == 0:
-        # Мы в кэше. Ищем сигнал на покупку.
-        if score >= 2:
+    now = time.time()
+    
+    if asset > 0 and entry > 0:
+        # Мы в позиции
+        pnl_pct = ((price - entry) / entry) * 100.0
+        hold_time_min = (now - entry_time) / 60.0
+        profit_usd = (price - entry) * asset
+        
+        if pnl_pct <= -STOP_LOSS_PCT:
+            action = "STOP_LOSS"
+            msg = f"🛑 СТОП-ЛОСС! Просадка {pnl_pct:.2f}% (PnL: {profit_usd:+.2f} USD)"
+        elif pnl_pct >= TAKE_PROFIT_PCT:
+            action = "TAKE_PROFIT"
+            msg = f"💰 ТЕЙК-ПРОФИТ! Прибыль {pnl_pct:.2f}% (PnL: {profit_usd:+.2f} USD)"
+        elif score <= -2:
+            action = "SELL"
+            msg = f"🔴 ПРОДАЖА ПО СИГНАЛУ (Score: {score}) (PnL: {profit_usd:+.2f} USD)"
+        elif hold_time_min > MAX_HOLD_TIME_MIN and pnl_pct < 1.0:
+            action = "TIME_EXIT"
+            msg = f"⏳ ВЫХОД ПО ВРЕМЕНИ (держим {hold_time_min:.0f} мин, PnL: {profit_usd:+.2f} USD)"
+        else:
+            action = "HOLD"
+            msg = f"🔵 ДЕРЖУ ПОЗИЦИЮ (Время: {hold_time_min:.0f} мин, PnL: {profit_usd:+.2f} USD / {pnl_pct:+.2f}%)"
+            
+        if action in ["STOP_LOSS", "TAKE_PROFIT", "SELL", "TIME_EXIT"]:
+            usd = asset * price
+            asset = 0.0
+            entry = 0.0
+            entry_time = 0.0
+            
+    else:
+        # Мы в кэше (ищем вход)
+        if score >= 4:
+            action = "STRONG_BUY"
+            msg = f"🚀 СИЛЬНАЯ ПОКУПКА (Score: +{score})"
+        elif score >= 2:
+            action = "BUY"
+            msg = f"🟢 ПОКУПКА (Score: +{score})"
+        else:
+            action = "WAIT"
+            msg = "⚪ БЕЗДЕЙСТВУЮ (ждем сигнала, баланс в USD)"
+            
+        if action in ["STRONG_BUY", "BUY"]:
             asset = usd / price
             usd = 0.0
             entry = price
-            action = "BUY"
-            msg = f"🟢 КУПИЛ {asset:.6f} ед. по ${price:.2f}"
-    elif asset > 0:
-        # Мы в позиции. Ищем сигнал на продажу.
-        if score <= 0:
-            usd = asset * price
-            asset = 0.0
-            pnl = usd - (entry * (usd / price) if price != 0 else usd) # Упрощенно
-            # Реальный расчет PnL: продали по текущей цене, вычли то, что потратили
-            # Если entry != 0, считаем разницу
-            profit = (price - entry) * asset
-            action = "SELL"
-            msg = f"🔴 ПРОДАЛ {asset:.6f} ед. по ${price:.2f} (PnL: {profit:+.2f} USD)"
-            asset = 0.0
-            entry = 0.0
-        else:
-            action = "HOLD"
-            profit = (price - entry) * asset
-            msg = f"🔵 ДЕРЖУ ПОЗИЦИЮ (Вход: ${entry:.2f}, PnL: {profit:+.2f} USD)"
-    else:
-        action = "WAIT"
-        msg = "⚪ БЕЗДЕЙСТВУЮ (нет сигналов, баланс в кэше)"
-        
-    new_state = {"usd": usd, "asset": asset, "entry": entry}
+            entry_time = now
+            
+    new_state = {
+        "usd": usd, 
+        "asset": asset, 
+        "entry": entry, 
+        "entry_time": entry_time,
+        "base_volume": base_vol
+    }
     return action, new_state, msg
 
 
@@ -327,8 +366,16 @@ def analyze():
         print(f"\n⏳ {datetime.now().strftime('%H:%M:%S')} — нет данных.")
         return
 
-    # Загружаем состояние бота
     state = load_state()
+
+    # Фиксируем базовый объем при первом запуске
+    if state["base_volume"] == 0.0 and len(volumes) > 0:
+        state["base_volume"] = volumes[-1]
+        save_state(state)
+        
+    base_vol = state["base_volume"] if state["base_volume"] > 0 else 1.0
+    current_vol = volumes[-1]
+    rel_vol = current_vol / base_vol
 
     price = closes[-1]
     dec = cfg["decimals"]
@@ -348,85 +395,75 @@ def analyze():
     print(f"💰 Цена: {price:.{dec}f} USD | Баров: {len(closes)}")
 
     if r is not None:
-        if r < 30: tag = "перепродан (ожидаем отскок вверх)"
+        if r < 30: tag = "перепродан (ожидаем отскок)"
         elif r > 70: tag = "перекуплен (риск коррекции)"
-        elif r > 50: tag = "бычий настрой (выше 50)"
-        else: tag = "медвежий настрой (ниже 50)"
+        elif r > 50: tag = "бычий настрой"
+        else: tag = "медвежий настрой"
         print(f"📈 RSI({RSI_PERIOD}): {r:.2f} → {tag}")
 
     if m is not None:
-        if m > s:
-            direction = "БЫЧИЙ"
-            tag = "импульс растет" if h > h_prev else "импульс слабеет"
-        else:
-            direction = "МЕДВЕЖИЙ"
-            tag = "давление растет" if h < h_prev else "давление слабеет"
-        print(f"📊 MACD: {m:.4f} | сигнал: {s:.4f} | гист: {h:+.4f}")
-        print(f"   → {direction} ({tag})")
+        direction = "БЫЧИЙ" if m > s else "МЕДВЕЖИЙ"
+        tag = "импульс растет" if (m > s and h > h_prev) or (m < s and h < h_prev) else "импульс слабеет"
+        print(f"📊 MACD: {m:.4f} | сигнал: {s:.4f} | гист: {h:+.4f} → {direction} ({tag})")
 
     if e_fast and e_slow:
         diff = e_fast[-1] - e_slow[-1]
-        if diff > 0:
-            tag = "восходящий тренд" if price > e_fast[-1] else "коррекция к EMA9"
-        else:
-            tag = "нисходящий тренд" if price < e_fast[-1] else "отскок к EMA9"
-        print(f"📉 EMA{EMA_FAST}={e_fast[-1]:.{dec}f} / EMA{EMA_SLOW}={e_slow[-1]:.{dec}f}")
-        print(f"   → {tag}")
+        tag = ("восходящий тренд" if price > e_fast[-1] else "коррекция") if diff > 0 else ("нисходящий тренд" if price < e_fast[-1] else "отскок")
+        print(f"📉 EMA{EMA_FAST}={e_fast[-1]:.{dec}f} / EMA{EMA_SLOW}={e_slow[-1]:.{dec}f} → {tag}")
 
     if atr_val is not None:
         atr_pct = atr_val / price * 100.0
-        if atr_pct < 0.05: tag = "очень низкая (флэт, сжатие)"
-        elif atr_pct < 0.15: tag = "низкая (спокойный рынок)"
-        elif atr_pct < 0.3: tag = "умеренная (нормальный ход)"
-        else: tag = "высокая (волатильный рынок)"
+        tag = "низкая" if atr_pct < 0.15 else ("умеренная" if atr_pct < 0.3 else "высокая")
         print(f"📏 ATR({ATR_PERIOD}): {atr_val:.{dec}f} ({atr_pct:.3f}%) → {tag}")
 
     if adx_val is not None:
-        if adx_val < 20: tag = "ФЛЭТ / нет тренда"
-        elif adx_val < 25: tag = "зарождение тренда"
-        else: tag = "СИЛЬНЫЙ ТРЕНД"
-        di_dir = "Быки сильнее (+DI)" if plus_di > minus_di else "Медведи сильнее (-DI)"
-        print(f"🧗 ADX({ADX_PERIOD}): {adx_val:.1f} → {tag}")
-        print(f"   +DI: {plus_di:.1f} | -DI: {minus_di:.1f} → {di_dir}")
+        tag = "ФЛЭТ" if adx_val < 20 else ("зарождение" if adx_val < 25 else "СИЛЬНЫЙ ТРЕНД")
+        di_dir = "Быки (+DI)" if plus_di > minus_di else "Медведи (-DI)"
+        print(f"🧗 ADX({ADX_PERIOD}): {adx_val:.1f} → {tag} | {di_dir}")
 
     if bb_up is not None:
-        band_width_pct = (bb_up - bb_low) / bb_mid * 100.0
-        if price > bb_up: tag = "ПРОБОЙ ВЕРХНЕЙ (перегрев)"
-        elif price < bb_low: tag = "ПРОБОЙ НИЖНЕЙ (перепродажа)"
-        elif band_width_pct < 0.2: tag = "СЖАТИЕ (сквиз, ждем импульс)"
-        else: tag = "внутри канала"
-        print(f"🎈 BB({BB_PERIOD}): {bb_low:.{dec}f} | {bb_mid:.{dec}f} | {bb_up:.{dec}f}")
-        print(f"   → {tag}")
+        tag = "пробой верхней" if price > bb_up else ("пробой нижней" if price < bb_low else "внутри канала")
+        print(f"🎈 BB({BB_PERIOD}): {bb_low:.{dec}f} | {bb_mid:.{dec}f} | {bb_up:.{dec}f} → {tag}")
 
-    current_vol = volumes[-1]
     if avg_vol > 0:
-        vol_ratio = current_vol / avg_vol
-        if vol_ratio > 1.5: tag = "ВСПЛЕСК (подтверждение движения)"
-        elif vol_ratio < 0.5: tag = "низкий (нет интереса)"
-        else: tag = "средний (норма)"
-        print(f"📦 Объем: {current_vol:.0f} (ср. {avg_vol:.0f}) → {tag}")
+        print(f"📦 Объем: {current_vol:.0f} (отн. старта: {rel_vol:.2f}x) → " + 
+              ("ВСПЛЕСК" if current_vol > avg_vol * 1.5 else "норма"))
 
-    # Итоговый счёт
+    # --- ГЛОБАЛЬНЫЙ ПОДСЧЕТ ОЧКОВ ---
     score = 0
     if r is not None:
         if RSI_MODE == "reversion":
             score += 1 if r < 30 else (-1 if r > 70 else 0)
         else:
             score += 1 if r > 50 else -1
+            
     if m is not None:
         score += 1 if m > s else -1
+        
     if e_fast and e_slow:
         score += 1 if e_fast[-1] > e_slow[-1] else -1
+        
+    if adx_val is not None and adx_val > 20:
+        score += 1 if plus_di > minus_di else -1
+        
+    if bb_up is not None:
+        if price > bb_up: score -= 1  # Перегрев, ожидаем откат
+        elif price < bb_low: score += 1  # Перепродажа, ожидаем рост
+        
+    if avg_vol > 0 and current_vol > avg_vol * 1.5:
+        # Всплеск объема подтверждает движение цены
+        if price > closes[-2]: score += 1
+        elif price < closes[-2]: score -= 1
 
-    verdict = {
-        3:  "🟢 Сильный бычий сигнал",
-        2:  "🟢 Умеренно бычий",
-        1:  "🟡 Слабый бычий",
-        0:  "⚪ Нейтрально",
-        -1: "🟡 Слабый медвежий",
-        -2: "🔴 Умеренно медвежий",
-        -3: "🔴 Сильный медвежий",
-    }[score]
+    # Оценка от -6 до +6
+    if score >= 4: verdict = "🟢 СИЛЬНЫЙ БЫЧИЙ СИГНАЛ"
+    elif score >= 2: verdict = "🟢 Умеренно бычий"
+    elif score == 1: verdict = "🟡 Слабый бычий"
+    elif score == 0: verdict = "⚪ Нейтрально"
+    elif score == -1: verdict = "🟡 Слабый медвежий"
+    elif score >= -3: verdict = "🔴 Умеренно медвежий"
+    else: verdict = "🔴 СИЛЬНЫЙ МЕДВЕЖИЙ СИГНАЛ"
+
     print("-" * 50)
     print(f"🧭 Сводка (score={score:+d}): {verdict}")
     
@@ -439,7 +476,6 @@ def analyze():
     print("=" * 50)
     print(f"🤖 ДЕЙСТВИЕ БОТА: {bot_msg}")
     
-    # Расчитываем общий капитал (Equity)
     total_usd = new_state["usd"]
     total_asset = new_state["asset"]
     equity = total_usd + (total_asset * price)
@@ -459,7 +495,6 @@ def main():
     print(f"🚀 Анализатор {cfg['name']} ({cfg['ticker']}) запущен.")
     print(f"   Обновление каждые {INTERVAL} сек. Остановить: Ctrl+C.")
     
-    # Проверяем баланс при старте (создаст файл, если его нет)
     state = load_state()
     save_state(state)
     print(f"💰 Стартовый баланс: ${state['usd']:.2f} (Актив: {state['asset']:.6f})")
